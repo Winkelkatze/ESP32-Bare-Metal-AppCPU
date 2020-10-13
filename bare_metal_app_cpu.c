@@ -1,3 +1,29 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2020 Daniel Frejek
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+
+
 #include <soc/dport_reg.h>
 #include <soc/cpu.h>
 #include <esp_heap_caps.h>
@@ -38,13 +64,13 @@ static char hello_world[] = "Hello World!\n";
 #endif
 
 // APP CPU cache is part of the main memory pool and we can't get the caches to work easily anyway because cache loads need to be synchronized.
-// So, for now the app core can only execute from IRAM (and internal ROM).
+// So for now the app core can only execute from IRAM (and internal ROM).
 // Also, the APP CPU CANNOT load data from the flash!
 static void IRAM_ATTR app_cpu_main()
 {
 	// User code goes here
 #ifdef APP_CPU_RESERVE_ROM_DATA
-	ets_printf(hello_world);
+	ets_printf(hello_world); // Do not specify a "Hello World" here, as this would be stored in the flash!
 #endif
 }
 
@@ -53,6 +79,11 @@ static void IRAM_ATTR app_cpu_main()
 // Having a volatile pointer around should force the compiler to behave.
 static void (* volatile app_cpu_main_ptr)() = &app_cpu_main;
 
+/*
+ * This is the entry point for the APP CPU.
+ * When the CPU is enabled the first time, we just "warm up" things, so we do some initialization before turning the clock off again.
+ * Then the start function will load the real stack pointer and switch the CPU on again.
+ */
 static void IRAM_ATTR app_cpu_init()
 {
 	// init interrupt handler
@@ -91,6 +122,8 @@ static void IRAM_ATTR app_cpu_init()
 			"l32i a1, %0, 0\n"				\
 			::"r"(&app_cpu_stack_ptr));
 
+		// Finally call the main.
+		// Its imperative for the main to be NOT INLINED!
 		app_cpu_main();
 	}
 }
@@ -104,6 +137,7 @@ bool start_app_cpu()
 	printf("APP_CPU RESET: %u\n", DPORT_READ_PERI_REG(DPORT_APPCPU_CTRL_A_REG));
 	printf("APP_CPU CLKGATE: %u\n", DPORT_READ_PERI_REG(DPORT_APPCPU_CTRL_B_REG));
 	printf("APP_CPU STALL: %u\n", DPORT_READ_PERI_REG(DPORT_APPCPU_CTRL_C_REG));
+	printf("APP_CACHE_CTRL: %08x\n", DPORT_READ_PERI_REG(DPORT_APP_CACHE_CTRL_REG));
 #endif
 
 	if (!app_cpu_initial_start)
@@ -120,7 +154,10 @@ bool start_app_cpu()
 
 	if (!app_cpu_stack_ptr)
 	{
+		// We need to allocate the stack for the APP CPU here, since the original stack from the time when the APP CPU was initialized is now some part of the heap.
 		app_cpu_stack_ptr = (uint32_t)heap_caps_malloc(APP_CPU_STACK_SIZE, MALLOC_CAP_DMA);
+
+		// Don't forget to set the stack ptr to the end of the segment
 		app_cpu_stack_ptr += APP_CPU_STACK_SIZE - sizeof(size_t);
 	}
 
@@ -134,23 +171,39 @@ bool start_app_cpu()
 
 
 /*
- * Initializes the app cpu. This needs to be called before the heap is initialized (heap_caps_init()).
- * Insert a call to this into the cpu_start.c file found in the SDK.
+ * Initializes the app cpu. Somehow the APP cpu will wreak havoc on the heap when it starts.
+ * Even if I give it a trivial infinite loop, it will still cause memory corruption.
+ * Not sure what exactly is going on there, might be some kind of initialization sequence of the hardware maybe?
+ * Anyway, the only possible workaround is to do it like the SDK and start the CPU before the heap is initialized.
+ * Therefore we need to insert a call to this in cpu_start.c from the SDK before it calls heap_caps_init().
+ * We will then do some initialization on the APP CPU before turning off the clock again until the APP core is needed.
  */
 void init_app_cpu_baremetal()
 {
+	// just in case...
+	// disable the clock gate of the app core
+	DPORT_REG_CLR_BIT(DPORT_APPCPU_CTRL_B_REG, DPORT_APPCPU_CLKGATE_EN);
+
 	app_cpu_initial_start = 0;
 
-	for (int i = ETS_WIFI_MAC_INTR_SOURCE; i <= ETS_CACHE_IA_INTR_SOURCE; i++) {
+	// disable all interrupts
+	// should be disabled by default anyway, but in case we have a bootloader, we don't know what it has already done
+	for (int i = ETS_WIFI_MAC_INTR_SOURCE; i <= ETS_CACHE_IA_INTR_SOURCE; i++)
+	{
         intr_matrix_set(1, i, ETS_INVALID_INUM);
     }
 
+	// Reset the CPU
 	DPORT_REG_SET_BIT(DPORT_APPCPU_CTRL_A_REG, DPORT_APPCPU_RESETTING);
 	DPORT_REG_CLR_BIT(DPORT_APPCPU_CTRL_A_REG, DPORT_APPCPU_RESETTING);
 
+	// Load the entry vector
 	DPORT_WRITE_PERI_REG(DPORT_APPCPU_CTRL_D_REG, ((uint32_t)&app_cpu_init));
+
+	// And turn the clock on
 	DPORT_SET_PERI_REG_MASK(DPORT_APPCPU_CTRL_B_REG, DPORT_APPCPU_CLKGATE_EN);
 
+	// finally wait for the CPU to start
 	while(!app_cpu_initial_start){}
 }
 
